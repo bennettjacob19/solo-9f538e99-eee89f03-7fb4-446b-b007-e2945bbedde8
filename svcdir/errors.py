@@ -55,6 +55,24 @@ class BackupNameTaken(ConflictError):
     code = "backup_name_taken"
 
 
+class UnknownVersion(NotFoundError):
+    status_code = 404
+    code = "unknown_version"
+
+    def __init__(self, version: int) -> None:
+        super().__init__(f"未知的目录版本: {version}")
+
+
+class FutureVersion(ConflictError):
+    status_code = 409
+    code = "future_version"
+
+    def __init__(self, version: int, current: int) -> None:
+        super().__init__(
+            f"目录版本 {version} 高于当前版本 {current}，客户端游标无效"
+        )
+
+
 class BackupValidationError(DirectoryError):
     status_code = 422
     code = "invalid_backup"

@@ -12,6 +12,13 @@
 docker compose up --build
 ```
 
+启动后可验证长轮询（立即返回当前版本，或最多等 15 秒）：
+
+```bash
+V=$(curl -s http://localhost:8000/api/state | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')
+curl -s "http://localhost:8000/api/changes?since=$V&wait=15"
+```
+
 - 网页：<http://localhost:8000/>
 - API：`GET http://localhost:8000/resolve?name=orders-api`
 - 健康检查：`GET /healthz`
@@ -43,6 +50,7 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | GET | `/resolve` | 返回整个当前目录 |
 | GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
 | GET | `/api/backups` | 备份列表 |
+| GET | `/api/changes?since=<版本>[&wait=<秒>]` | 长轮询变更（见下） |
 | POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
 | DELETE | `/api/services/<名>` | 删除 |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
@@ -58,6 +66,51 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 {"ok": true, "version": 6, "restore_in_progress": false,
  "name": "orders-api", "address": "10.0.0.12:8080"}
 ```
+
+## 客户端变更监听（长轮询）
+
+客户端缓存目录后，地址可能因为改址、删除或备份恢复而过期。`GET /api/changes`
+让客户端用「上次收到的目录版本」作为游标等待变更：
+
+```bash
+curl 'http://localhost:8000/api/changes?since=6'
+```
+
+- **参数**：`since`（也接受别名 `cursor`）是上次收到的目录版本；`wait`（别名
+  `timeout`）是最多等待的秒数，默认且最多 **15 秒**，`0` 表示立即返回。
+- **有新提交**：立即返回当前版本与相对旧游标的净变化：
+
+  ```json
+  {"ok": true, "since": 6, "version": 9, "changed": true, "timed_out": false,
+   "changes": {
+     "added":   [{"service": "payments", "address": "10.0.0.30:80"}],
+     "updated": [{"service": "orders-api", "old_address": "10.0.0.12:8080",
+                  "address": "10.0.0.13:8080"}],
+     "removed": [{"service": "legacy", "address": "10.0.0.9:80"}]
+   },
+   "version_info": {"version": 9, "created_at": "...", "kind": "restore",
+                    "note": "恢复备份 nightly"}}
+  ```
+
+- **净变化**：变化由两个完整不可变版本直接比较得出，因此连续多次修改、或是
+  一次恢复，都只返回 `since -> 当前版本` 的最终差异。
+- **版本只增不减**：即使目录内容回到与游标完全一致（例如改回原地址、或恢复
+  到内容相同的备份），`version` 也会前进；此时 `changes` 三个列表为空，
+  `changed` 仍为 `true`。
+- **超时**：返回原版本、`timed_out: true` 和三个空列表（并带 `retry_after`），
+  客户端用同一个 `since` 继续等待即可。
+- **未知 / 未来版本**：游标对应的版本不存在 → `404 unknown_version`；游标高于
+  当前版本 → `409 future_version`。省略 `since` 则返回当前版本和空变化，
+  用于首次获取游标（配合 `/api/state` 读取完整目录）。
+- **读库失败不会被伪装成超时**：数据库错误按原样返回 `500`/`503`。
+- **等待期间一切照常**：写、删除、创建备份与恢复都不被长轮询阻塞；恢复进行
+  中等待依旧持续，恢复提交后立即返回新版本。进程内提交会即时唤醒等待者，
+  其他进程的提交由最多 1 秒一次的轻量版本检查发现。
+- **重启后可追赶**：游标就是数据库里的版本号，进程重启后仍可用旧游标调用
+  `/api/changes` 得到净变化（旧版本行永不删除）。
+
+网页上的「变更监听」卡片可手动开启监听：操作目录（新增、改址、删除、恢复）
+后即可看到返回的变化列表和新版本号，目录表与版本徽标也会同步刷新。
 
 ## 一致性与恢复语义
 
@@ -108,6 +161,13 @@ python3 -m pytest -q
 - `test_restore_can_run_after_prior_abandoned_marker`
 - `test_live_restore_lease_survives_sibling_process_initialization`
 - `test_backup_row_pins_one_version_during_continuous_writes`
+- `test_changes_collapse_continuous_edits_to_final_state`
+- `test_version_advances_even_when_content_returns_to_original`
+- `test_changes_after_restore_report_net_effect`
+- `test_wait_returns_as_soon_as_a_change_commits` / `test_wait_during_restore_keeps_polling_and_sees_new_version`
+- `test_wait_surfaces_database_failure_instead_of_faking_timeout`
+- `test_old_cursor_still_catches_up_after_restart`
+- `test_http_change_endpoint` / `test_http_change_endpoint_timeout_and_errors`
 - `test_http_rejects_writes_and_serves_reads_during_restore`
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
@@ -135,3 +195,7 @@ Dockerfile / docker-compose.yml
 - 未做用户认证与 HTTPS——按需求这是本地运维工具，请只在内网使用。
 - 恢复的「已受理查询」保证依赖单个查询请求只在一个读事务里读完（当前实现如此）；
   没有为客户端提供跨多个独立 HTTP 请求的版本固定参数。
+- 长轮询等待者占一个 Web 线程；镜像内的 gunicorn 配置了 16 个线程。若大量客户端
+  长期长轮询，需要相应调高线程数或改用专门的事件驱动部署。
+- 跨进程的提交没有通知机制（SQLite 无跨进程唤醒），其他进程的变更最多滞后
+  `CHANGE_POLL_INTERVAL`（1 秒）被发现；同一进程内提交即时唤醒。

@@ -8,7 +8,16 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .errors import DirectoryError, InputError
-from .store import DirectoryStore
+from .store import (
+    MAX_CHANGE_WAIT_SECONDS,
+    DirectoryStore,
+    parse_cursor,
+    parse_wait_seconds,
+)
+
+
+def _empty_changes() -> dict:
+    return {"added": [], "updated": [], "removed": []}
 
 
 def _store_from_env() -> DirectoryStore:
@@ -42,6 +51,10 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
             "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; "
             "base-uri 'none'",
         )
+        if request.path == "/api/changes":
+            # A long-poll answer is specific to one cursor; never let a proxy
+            # or browser replay a stale response.
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     # -- error handling ---------------------------------------------------
@@ -129,6 +142,42 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.get("/api/backups")
     def api_backups():
         return jsonify({"ok": True, "backups": store.list_backups()})
+
+    @app.get("/api/changes")
+    def api_changes():
+        # ``since`` is the directory version the client last received.  A client
+        # that has never seen a version omits it and gets the current one with
+        # an empty change set (everything is available via /api/state).
+        raw_since = request.args.get("since", request.args.get("cursor"))
+        wait = parse_wait_seconds(request.args.get("wait", request.args.get("timeout")))
+        if raw_since is None or raw_since.strip() == "":
+            head = store.head()
+            return jsonify(
+                {
+                    "ok": True,
+                    "since": None,
+                    "version": head["version"],
+                    "changed": False,
+                    "timed_out": False,
+                    "changes": _empty_changes(),
+                    "version_info": head["version_info"],
+                }
+            )
+        since = parse_cursor(raw_since)
+        result = store.wait_for_changes(since, wait)
+        body = {
+            "ok": True,
+            "since": result["since"],
+            "version": result["version"],
+            "changed": result["changed"],
+            "timed_out": result["timed_out"],
+            "changes": result["changes"],
+            "version_info": result["version_info"],
+        }
+        if result["timed_out"]:
+            # Tell well-behaved clients how soon to come back.
+            body["retry_after"] = int(MAX_CHANGE_WAIT_SECONDS)
+        return jsonify(body)
 
     @app.post("/api/services")
     def api_upsert():

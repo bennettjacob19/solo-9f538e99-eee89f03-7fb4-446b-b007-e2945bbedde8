@@ -25,6 +25,8 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
 
 # Threads (not processes) on purpose: the restore lease/validation state lives
 # in SQLite and every request is handled correctly across processes too, but a
-# single process with a thread pool keeps SQLite contention low.
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "8", \
+# single process with a thread pool keeps SQLite contention low.  The thread
+# count leaves headroom for long-polling clients: each `/api/changes` request
+# holds a thread for at most 15 seconds while it waits.
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "16", \
      "--timeout", "60", "--access-logfile", "-", "svcdir.__main__:app"]

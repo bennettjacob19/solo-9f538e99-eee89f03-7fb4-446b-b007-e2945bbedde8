@@ -12,8 +12,13 @@ from svcdir import DirectoryStore, create_app
 from svcdir.errors import (
     BackupValidationError,
     ConflictError,
+    DatabaseError,
+    DirectoryError,
+    FutureVersion,
+    InputError,
     NotFoundError,
     RestoreInProgress,
+    UnknownVersion,
 )
 
 
@@ -693,6 +698,308 @@ def test_backup_row_pins_one_version_during_continuous_writes(store):
         assert rows["a"] in published | {"0"}
         assert backup["entry_count"] == 2
         assert store.validate_backup(backup["name"])["valid"] is True
+
+
+# ---------------------------------------------------------------------------
+# Change feed / long polling
+
+
+def test_changes_return_net_add_update_and_delete(store):
+    seed(store, {"keep": "1", "drop": "2", "move": "3"})
+    cursor = store.resolve()["version"]
+    store.upsert("added", "9")
+    store.upsert("move", "3-new")
+    store.delete("drop")
+
+    result = store.changes_since(cursor)
+    assert result["since"] == cursor
+    assert result["version"] > cursor
+    assert result["changed"] is True
+    assert result["changes"]["added"] == [{"service": "added", "address": "9"}]
+    assert result["changes"]["updated"] == [
+        {"service": "move", "old_address": "3", "address": "3-new"}
+    ]
+    assert result["changes"]["removed"] == [{"service": "drop", "address": "2"}]
+
+
+def test_changes_collapse_continuous_edits_to_final_state(store):
+    seed(store, {"a": "0"})
+    cursor = store.resolve()["version"]
+    for i in range(1, 6):
+        store.upsert("a", f"v{i}")
+    store.upsert("b", "first")
+    store.upsert("b", "second")
+    store.delete("b")
+
+    result = store.changes_since(cursor)
+    assert result["changes"] == {
+        "added": [],
+        "updated": [{"service": "a", "old_address": "0", "address": "v5"}],
+        "removed": [],
+    }
+
+
+def test_version_advances_even_when_content_returns_to_original(store):
+    seed(store, {"a": "1"})
+    backup = store.create_backup("snap")
+    cursor = store.resolve()["version"]
+    store.upsert("a", "2")
+    store.upsert("a", "1")
+
+    result = store.changes_since(cursor)
+    assert result["version"] > cursor
+    assert result["changed"] is True
+    assert result["changes"] == {"added": [], "updated": [], "removed": []}
+
+    # A restore onto identical content must also move the version forward.
+    store.restore_backup(backup["name"])
+    after_restore = store.changes_since(cursor)
+    assert after_restore["version"] > result["version"]
+    assert after_restore["changes"] == {"added": [], "updated": [], "removed": []}
+
+
+def test_changes_after_restore_report_net_effect(store):
+    seed(store, {"a": "old", "b": "old", "gone": "x"})
+    store.create_backup("snap")
+    store.upsert("a", "live")
+    store.delete("gone")
+    store.upsert("c", "new")
+    cursor = store.resolve()["version"]
+
+    store.upsert("d", "transient")
+    store.restore_backup("snap")
+
+    result = store.changes_since(cursor)
+    assert result["changes"] == {
+        "added": [{"service": "gone", "address": "x"}],
+        "updated": [{"service": "a", "old_address": "live", "address": "old"}],
+        "removed": [{"service": "c", "address": "new"}],
+    }
+
+
+def test_unknown_and_future_cursors_are_errors(store):
+    current = store.resolve()["version"]
+    with pytest.raises(UnknownVersion):
+        store.changes_since(0)  # version 0 never exists (AUTOINCREMENT starts at 1)
+    with pytest.raises(FutureVersion):
+        store.changes_since(current + 1)
+    with pytest.raises(FutureVersion):
+        store.changes_since(999999)
+    with pytest.raises(InputError):
+        store.changes_since(-1)
+
+
+def test_wait_times_out_with_original_version_and_empty_changes(store):
+    seed(store, {"a": "1"})
+    cursor = store.resolve()["version"]
+    started = time.monotonic()
+    result = store.wait_for_changes(cursor, timeout=0.2)
+    elapsed = time.monotonic() - started
+    assert result["timed_out"] is True
+    assert result["version"] == cursor
+    assert result["changes"] == {"added": [], "updated": [], "removed": []}
+    assert elapsed >= 0.19
+    assert elapsed < 5
+
+
+def test_wait_returns_as_soon_as_a_change_commits(store):
+    seed(store, {"a": "1"})
+    cursor = store.resolve()["version"]
+    outcome: dict = {}
+
+    def waiter():
+        outcome["value"] = store.wait_for_changes(cursor, timeout=10)
+
+    thread = threading.Thread(target=waiter)
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.2)
+    store.upsert("a", "2")
+    thread.join(10)
+
+    assert thread.is_alive() is False
+    assert outcome["value"]["timed_out"] is False
+    assert outcome["value"]["version"] > cursor
+    assert outcome["value"]["changes"]["updated"][0]["address"] == "2"
+    assert time.monotonic() - started < 5
+
+
+def test_wait_is_not_blocked_by_regular_writes_backups_and_restores(store):
+    """A waiting client keeps waiting while other operations proceed normally."""
+    seed(store, {"a": "1", "b": "2"})
+    store.create_backup("snap")
+    cursor = store.resolve()["version"]
+    outcome: dict = {}
+
+    def waiter():
+        outcome["value"] = store.wait_for_changes(cursor, timeout=10)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    time.sleep(0.1)
+    # These must not fail or block on the waiter.
+    store.create_backup("snap2")
+    store.upsert("a", "live")
+    store.restore_backup("snap")
+    thread.join(10)
+
+    assert outcome["value"]["timed_out"] is False
+    assert outcome["value"]["version"] > cursor
+    final = store.resolve()
+    assert final["services"] == {"a": "1", "b": "2"}
+    # The waiter may have returned on the first commit; polling again from the
+    # same cursor still converges on the final net state.
+    caught_up = store.changes_since(cursor)
+    assert caught_up["version"] == final["version"]
+    assert caught_up["changes"] == {"added": [], "updated": [], "removed": []}
+
+
+def test_wait_during_restore_keeps_polling_and_sees_new_version(store):
+    seed(store, {"a": "old"})
+    store.create_backup("snap")
+    store.upsert("a", "live")
+    cursor = store.resolve()["version"]
+
+    gate = BlockingHooks().install(store, "validated")
+    restore_thread = threading.Thread(target=store.restore_backup, args=("snap",))
+    restore_thread.start()
+    assert gate.reached.wait(10)
+
+    outcome: dict = {}
+
+    def waiter():
+        outcome["value"] = store.wait_for_changes(cursor, timeout=10)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    time.sleep(0.3)
+    assert thread.is_alive(), "waiter must not fail while a restore is in progress"
+    # Reads during a restore still return a complete directory.
+    assert store.resolve()["restore_in_progress"] is True
+
+    gate.release.set()
+    restore_thread.join(10)
+    thread.join(10)
+
+    assert outcome["value"]["timed_out"] is False
+    assert outcome["value"]["changes"]["updated"] == [
+        {"service": "a", "old_address": "live", "address": "old"}
+    ]
+
+
+def test_wait_surfaces_database_failure_instead_of_faking_timeout(store, monkeypatch):
+    cursor = store.resolve()["version"]
+
+    def boom(*args, **kwargs):
+        raise DatabaseError("磁盘读取失败")
+
+    monkeypatch.setattr(store, "changes_since", boom)
+    with pytest.raises(DatabaseError):
+        store.wait_for_changes(cursor, timeout=0.2)
+
+
+def test_wait_surfaces_translated_sqlite_busy(store, monkeypatch):
+    store.ping()  # initialise before the connection is sabotaged
+    cursor = store.resolve()["version"]
+    calls = {"n": 0}
+    original = store._connect
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original()
+
+    monkeypatch.setattr(store, "_connect", flaky)
+    with pytest.raises(DirectoryError) as excinfo:
+        store.wait_for_changes(cursor, timeout=5)
+    assert excinfo.value.code == "database_busy"
+
+
+def test_old_cursor_still_catches_up_after_restart(tmp_path):
+    db = tmp_path / "dir.sqlite3"
+    first = DirectoryStore(db)
+    first.upsert("a", "1")
+    cursor = first.resolve()["version"]
+    first.upsert("a", "2")
+    first.upsert("b", "3")
+
+    restarted = DirectoryStore(db)
+    restarted.initialize()
+    result = restarted.changes_since(cursor)
+    assert result["changes"]["added"] == [{"service": "b", "address": "3"}]
+    assert result["changes"]["updated"] == [
+        {"service": "a", "old_address": "1", "address": "2"}
+    ]
+    assert restarted.wait_for_changes(cursor, timeout=0.1)["timed_out"] is False
+
+
+def test_http_change_endpoint(client):
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    state = client.get("/api/state").get_json()
+    cursor = state["version"]
+
+    # A client without a cursor gets the current version and no changes.
+    fresh = client.get("/api/changes").get_json()
+    assert fresh["ok"] is True
+    assert fresh["since"] is None
+    assert fresh["version"] == cursor
+    assert fresh["changes"] == {"added": [], "updated": [], "removed": []}
+
+    client.post("/api/services", json={"service": "b", "address": "2"})
+    client.delete("/api/services/a")
+    body = client.get(f"/api/changes?since={cursor}").get_json()
+    assert body["since"] == cursor
+    assert body["version"] > cursor
+    assert body["changed"] is True
+    assert body["timed_out"] is False
+    assert body["changes"]["added"] == [{"service": "b", "address": "2"}]
+    assert body["changes"]["removed"] == [{"service": "a", "address": "1"}]
+    assert body["version_info"]["kind"] == "update"
+
+    # Cursor alias still works.
+    assert client.get(f"/api/changes?cursor={cursor}").get_json()["version"] == body["version"]
+
+
+def test_http_change_endpoint_timeout_and_errors(client):
+    version = client.get("/api/state").get_json()["version"]
+    timed = client.get(f"/api/changes?since={version}&wait=0.05").get_json()
+    assert timed["timed_out"] is True
+    assert timed["version"] == version
+    assert timed["changes"] == {"added": [], "updated": [], "removed": []}
+
+    # A long requested wait is clamped to 15s, but `wait=0` returns immediately.
+    started = time.monotonic()
+    immediate = client.get(f"/api/changes?since={version}&wait=0").get_json()
+    assert immediate["timed_out"] is True
+    assert time.monotonic() - started < 2
+
+    future = client.get(f"/api/changes?since={version + 1}&wait=0")
+    assert future.status_code == 409
+    assert future.get_json()["error"]["code"] == "future_version"
+
+    unknown = client.get("/api/changes?since=0&wait=0")
+    assert unknown.status_code == 404
+    assert unknown.get_json()["error"]["code"] == "unknown_version"
+
+    for bad in ["abc", "-1", "1.5", ""]:
+        resp = client.get(f"/api/changes?since={bad}&wait=0")
+        if resp.status_code == 200:  # empty cursor means "no cursor yet"
+            assert resp.get_json()["since"] is None
+        else:
+            assert resp.status_code == 400
+            assert resp.get_json()["error"]["code"] == "invalid_input"
+
+    resp = client.get(f"/api/changes?since={version}&wait=soon")
+    assert resp.status_code == 400
+    resp = client.get(f"/api/changes?since={version}&wait=-3")
+    assert resp.status_code == 400
+
+
+def test_html_page_has_change_watcher(client):
+    page = client.get("/").get_data(as_text=True)
+    assert "data-change-watch" in page
+    assert "/api/changes" in page
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,11 @@ Design summary
 * While a restore holds a live lease, writes are rejected with
   ``RestoreInProgress``.  An expired lease (crashed restorer) is reclaimed, and
   a restorer that lost its lease aborts instead of overwriting newer state.
+* Clients discover changes by long-polling ``changes_since``/``wait_for_changes``
+  with the version they last saw.  The diff is computed from the two complete
+  immutable versions, so it is always the *net* change and never a replay of
+  intermediate commits; version ids only move forward, even if the content
+  returns to an earlier state.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -45,9 +51,11 @@ from .errors import (
     DatabaseBusy,
     DatabaseError,
     DirectoryError,
+    FutureVersion,
     InputError,
     NotFoundError,
     RestoreInProgress,
+    UnknownVersion,
 )
 
 SCHEMA_VERSION = 1
@@ -56,6 +64,12 @@ MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MAX_CHANGE_WAIT_SECONDS = 15.0
+#: How often a waiting reader re-checks ``current_version`` when no local
+#: notification arrives.  Writes in this process wake waiters immediately;
+#: this interval only bounds the latency for writes from *other* processes
+#: (SQLite offers no cross-process wake-up), while keeping read load low.
+CHANGE_POLL_INTERVAL = 1.0
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -119,6 +133,39 @@ def _clean_note(raw: Any) -> str:
     return raw.strip()[:MAX_NOTE_LENGTH]
 
 
+def parse_cursor(raw: Any) -> int:
+    """Parse a client-supplied directory version (``since``/``cursor``)."""
+    if isinstance(raw, bool):
+        raise InputError("目录版本必须是整数")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not re.fullmatch(r"[0-9]+", text):
+            raise InputError("目录版本必须是非负整数")
+        value = int(text)
+    else:
+        raise InputError("目录版本必须是非负整数")
+    if value < 0:
+        raise InputError("目录版本必须是非负整数")
+    return value
+
+
+def parse_wait_seconds(raw: Any) -> float:
+    """Parse the long-poll wait duration; clamp to the 15 second ceiling."""
+    if raw is None or raw == "":
+        return MAX_CHANGE_WAIT_SECONDS
+    if isinstance(raw, bool):
+        raise InputError("等待时长必须是数字")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise InputError("等待时长必须是数字") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise InputError("等待时长必须是非负数字")
+    return min(seconds, MAX_CHANGE_WAIT_SECONDS)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -136,6 +183,32 @@ def _compute_digest(backup_name: str, version_id: int, entries: tuple[tuple[str,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _diff_entries(
+    old_rows: tuple[tuple[str, str], ...], new_rows: tuple[tuple[str, str], ...]
+) -> dict:
+    """Net difference between two complete, sorted ``(service, address)`` lists.
+
+    ``added``   - present now, absent before;
+    ``updated`` - present in both but the address changed;
+    ``removed`` - present before, absent now.
+    Both inputs are already ordered by service, so the output is deterministic.
+    """
+    old = dict(old_rows)
+    new = dict(new_rows)
+    added = [
+        {"service": s, "address": new[s]} for s in sorted(new.keys() - old.keys())
+    ]
+    removed = [
+        {"service": s, "address": old[s]} for s in sorted(old.keys() - new.keys())
+    ]
+    updated = [
+        {"service": s, "old_address": old[s], "address": new[s]}
+        for s in sorted(old.keys() & new.keys())
+        if old[s] != new[s]
+    ]
+    return {"added": added, "updated": updated, "removed": removed}
 
 
 def _translate_db_error(exc: sqlite3.Error) -> DirectoryError:
@@ -212,6 +285,12 @@ class DirectoryStore:
         self._hooks = dict(hooks or {})
         self._init_lock = threading.RLock()
         self._initialized = False
+        # In-process wake-up for long-polling readers.  Commits made here bump
+        # the sequence and wake waiters immediately; commits from *other*
+        # processes cannot be observed this way (SQLite has no cross-process
+        # notification), so waiting readers also poll at CHANGE_POLL_INTERVAL.
+        self._change_cond = threading.Condition()
+        self._change_seq = 0
 
     # -- infrastructure ---------------------------------------------------
 
@@ -234,7 +313,10 @@ class DirectoryStore:
 
     @contextlib.contextmanager
     def _txn(self, write: bool):
-        conn = self._connect()
+        try:
+            conn = self._connect()
+        except sqlite3.Error as exc:
+            raise _translate_db_error(exc) from exc
         try:
             try:
                 conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
@@ -519,6 +601,12 @@ class DirectoryStore:
         if hook is not None:
             hook(payload)
 
+    def _notify_change(self) -> None:
+        """Wake in-process long pollers after a commit that moved the version."""
+        with self._change_cond:
+            self._change_seq += 1
+            self._change_cond.notify_all()
+
     # -- public reads -----------------------------------------------------
 
     def resolve(self, name: str | None = None) -> dict:
@@ -579,6 +667,101 @@ class DirectoryStore:
         with self._txn(write=False) as conn:
             conn.execute("SELECT 1")
 
+    # -- change feed ------------------------------------------------------
+
+    def current_version(self) -> int:
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            return self._current_version(conn)
+
+    def head(self) -> dict:
+        """Current version plus its metadata, read in one snapshot."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            version = self._current_version(conn)
+            info = self._version_info(conn, version) or {}
+        return {"version": version, "version_info": info}
+
+    @staticmethod
+    def _version_info(conn: sqlite3.Connection, version_id: int) -> dict | None:
+        row = conn.execute(
+            "SELECT id, created_at, kind, note FROM versions WHERE id=?",
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "version": int(row["id"]),
+            "created_at": str(row["created_at"]),
+            "kind": str(row["kind"]),
+            "note": str(row["note"]),
+        }
+
+    def changes_since(self, since: int) -> dict:
+        """Describe the net difference between ``since`` and the current version.
+
+        The returned lists are computed by comparing the two complete immutable
+        versions, so any number of intermediate commits (or a restore) collapses
+        into the final net change.  ``since`` must be an existing version and
+        must not be newer than ``current_version``.  The whole computation runs
+        in one read transaction, so it is a single consistent snapshot.
+        """
+        if since < 0:
+            raise InputError("目录版本必须是非负整数")
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            current = self._current_version(conn)
+            if since > current:
+                raise FutureVersion(since, current)
+            info = self._version_info(conn, since)
+            if info is None:
+                raise UnknownVersion(since)
+            old_rows = self._entries(conn, since)
+            new_rows = self._entries(conn, current)
+            current_info = self._version_info(conn, current) or {}
+        return {
+            "since": since,
+            "version": current,
+            "changed": current != since,
+            "changes": _diff_entries(old_rows, new_rows),
+            "version_info": current_info,
+        }
+
+    def wait_for_changes(self, since: int, timeout: float = MAX_CHANGE_WAIT_SECONDS) -> dict:
+        """Long-poll until the directory moves past ``since`` or time runs out.
+
+        ``timeout`` is clamped to [/ 0, ``MAX_CHANGE_WAIT_SECONDS``].  A timeout
+        returns the unchanged cursor with empty change lists; only a real read
+        failure is allowed to surface as an error (never disguised as a
+        timeout).  If the process restarts mid-wait nothing is lost: the cursor
+        lives in the database, so the next poll catches up from the same point.
+        """
+        if since < 0:
+            raise InputError("目录版本必须是非负整数")
+        wait = max(0.0, min(float(timeout), MAX_CHANGE_WAIT_SECONDS))
+        deadline = time.monotonic() + wait
+        self._ensure_ready()
+        with self._change_cond:
+            seen_seq = self._change_seq
+        # Validate the cursor and report an already-visible change immediately.
+        result = self.changes_since(since)
+        if result["version"] != since:
+            return {**result, "timed_out": False}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**result, "timed_out": True}
+            # Sleep until a local commit wakes us, a remote-process commit is
+            # due for a re-check, or the deadline passes.  A read failure
+            # inside the loop propagates: it must never look like a timeout.
+            with self._change_cond:
+                if self._change_seq == seen_seq:
+                    self._change_cond.wait(
+                        timeout=min(CHANGE_POLL_INTERVAL, remaining)
+                    )
+                seen_seq = self._change_seq
+            if self.current_version() != since:
+                return {**self.changes_since(since), "timed_out": False}
     @contextlib.contextmanager
     def read_view(self):
         """Pin one version for the lifetime of the context.
@@ -617,6 +800,7 @@ class DirectoryStore:
                 (new_version, svc, addr),
             )
             self._set_current(conn, new_version)
+        self._notify_change()
         return {
             "version": new_version,
             "previous_version": previous,
@@ -640,6 +824,7 @@ class DirectoryStore:
             if cur.rowcount == 0:
                 raise NotFoundError(f"未知服务: {svc}")
             self._set_current(conn, new_version)
+        self._notify_change()
         return {
             "version": new_version,
             "previous_version": previous,
@@ -862,6 +1047,7 @@ class DirectoryStore:
                 "entry_count": validated.entry_count,
                 "digest": validated.digest,
             }
+            self._notify_change()
             self._fire("after_restore_commit", result)
             return result
         except BaseException:

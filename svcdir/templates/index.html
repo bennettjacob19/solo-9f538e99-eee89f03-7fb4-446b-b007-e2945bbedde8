@@ -24,12 +24,12 @@
   </div>
   {% endif %}
 
-  <section class="card">
-    <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
-    {% if state.services %}
+  <section class="card" data-directory data-state-endpoint="{{ url_for('api_state') }}"
+           data-delete-base="{{ url_for('form_delete', service='__SERVICE__') }}">
+    <h2>当前目录 <span class="badge" data-dir-badge>版本 {{ state.version }} · {{ state.count }} 项</span></h2>
     <table>
       <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
-      <tbody>
+      <tbody data-dir-rows>
       {% for row in state.services %}
         <tr>
           <td class="mono">{{ row.service }}</td>
@@ -42,11 +42,26 @@
           </td>
         </tr>
       {% endfor %}
+      {% if not state.services %}
+        <tr data-dir-empty><td colspan="3" class="muted">目录为空。请在下方添加服务。</td></tr>
+      {% endif %}
       </tbody>
     </table>
-    {% else %}
-    <p class="muted">目录为空。请在下方添加服务。</p>
-    {% endif %}
+  </section>
+
+  <section class="card" data-change-watch data-version="{{ state.version }}"
+           data-endpoint="{{ url_for('api_changes') }}">
+    <h2>变更监听 <span class="badge" data-watch-version>版本 {{ state.version }}</span></h2>
+    <p class="muted small">
+      开启后浏览器会使用 <span class="mono">/api/changes</span> 长轮询：把上次收到的
+      目录版本作为游标，最多等待 15 秒；期间新增、改址、删除或恢复都会以
+      「相对该游标的净变化」返回，并给出新版本号。
+    </p>
+    <div class="inline">
+      <button type="button" data-watch-toggle>开启监听</button>
+      <span class="small muted" data-watch-status>未监听，正在显示版本 {{ state.version }}。</span>
+    </div>
+    <ul class="changelog mono small" data-change-log aria-live="polite"></ul>
   </section>
 
   <section class="card">
@@ -104,6 +119,7 @@
   <section class="card">
     <h2>查询 API</h2>
     <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="mono small">GET /api/changes?since=&lt;目录版本&gt;（长轮询，最多 15 秒）</p>
   </section>
 </main>
 </body>
